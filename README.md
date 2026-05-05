@@ -13,6 +13,7 @@ This project implements a deep learning approach to estimate blood pressure (Sys
 - [Data Organization](#data-organization)
 - [File Structure](#file-structure)
 - [How to Reproduce](#how-to-reproduce)
+- [Experimental Setup, Architecture & Results](#experimental-setup-architecture--results)
 - [Notes](#notes)
 
 ## Project Structure
@@ -49,7 +50,8 @@ This project implements a deep learning approach to estimate blood pressure (Sys
 
 ### 1.2. Signal Filtering
 - **Purpose:** Remove noise and baseline drift from PPG signals
-- **Method:** Bandpass filter application
+- **Method:** Butterworth 4th-order bandpass, 0.5–12 Hz
+- **Sampling rate:** PPG `fs = 125 Hz`
 - **Function:** `apply_filter_to_segments`
 - **Output:** Filtered PPG signals replacing original data
 
@@ -65,7 +67,7 @@ This project implements a deep learning approach to estimate blood pressure (Sys
 
 ### 1.5. RR Interval Validation
 - **Criteria:** Physiological plausibility of RR intervals
-  - Range: 0.4s ≤ RR ≤ 1.5s
+  - Range: 0.33 s ≤ RR ≤ 1.5 s
   - Validity: At least 80% valid intervals
 - **Output:** `cleaned_segments_by_subject`
 
@@ -209,8 +211,8 @@ Contains pre-processed datasets ready for immediate use in Stage 2 (the results 
 └── README.md
 ```
 
-### Note about Raw Data Structure 
-The segmentation and preprocessing pipeline considered local subject dataframes under `saved_subjects_30/31/32` folders (not included in this export). Due to the extensive data processing requirements, we mentioned for that first data preparation with toy segments which choosen from `saved_subjects_32`.  It's possible to use the pre-processed dataset in `data/dataframes/` to start quickly training/validation. However, instead of running 5 segmented subjects, we recommended to run the complete `segment_to_cycle_loader.ipynb` pipeline, which can produce **19 subject included dataframe for the future use**. This will be give complete idea behind how the dataframes are going to proceed. 
+### Note about Raw Data Structure
+The segmentation and preprocessing pipeline expects local subject dataframes under `saved_subjects_30/31/32` folders (not included in this export). To keep the repo lightweight, the first stage of data preparation is illustrated with toy segments chosen from `saved_subjects_32` (see [toy_segments/](toy_segments/)). It is possible to use the pre-processed dataset in [data/dataframes/](data/dataframes/) to start training/validation quickly, but instead of running on only 5 segmented subjects, we recommend running the full [segment_to_cycle_loader.ipynb](segment_to_cycle_loader.ipynb) pipeline, which produces a **19-subject dataframe for downstream use** and gives a complete picture of how the dataframes are constructed.
 
 ## How to Reproduce
 
@@ -255,6 +257,74 @@ The segmentation and preprocessing pipeline considered local subject dataframes 
    - Check `models/` for saved model checkpoints
    - Review `results/` for predictions and analysis
 
+---
+
+## Experimental Setup, Architecture & Results
+
+The numbers below were obtained by training the `PPGtoABPRegressor` on the 19-subject peak-to-peak dataset and evaluating on the held-out test split. They correspond to the saved checkpoint [models/ppg_to_abp_cnn_subject_19_segment_19_fixed_row_1000.pth](models/ppg_to_abp_cnn_subject_19_segment_19_fixed_row_1000.pth) and the predictions pickle [results/ppg_abp_predictions_peak_to_peak_raw_19_subject_19_segment_subject_analyze.pkl](results/ppg_abp_predictions_peak_to_peak_raw_19_subject_19_segment_subject_analyze.pkl).
+
+### Experimental Setup
+
+| Aspect | Value |
+|---|---|
+| Model | `PPGtoABPRegressor` (5 conv blocks + 1×1 conv + FC) |
+| Input | `(128, 3, 120)` — (batch, channels, samples) |
+| Output | 2 neurons — `[SBP, DBP]` mmHg |
+| Batch size | 128 |
+| Learning rate | 1e-4 |
+| Epochs | 60 |
+| Loss | L1 (MAE) |
+| Train / Val / Test | 86,584 / 11,697 / 21,636 |
+| Subjects | 19 |
+| Normalization | Z-score per channel (PPG only) |
+| Test MAE (pre-calib) | 16.60 mmHg (SBP) |
+| Test MAE (post-calib) | 15.86 mmHg (SBP) |
+| Calibration | `SBP_cal = 0.5840 · SBP_pred + 51.92` |
+| PPG sampling rate | 125 Hz |
+| Filter | Butterworth 4th order, 0.5–12 Hz |
+| Quality threshold | 0.92 |
+| RR range | 0.33–1.5 s |
+
+### Model Architecture
+
+Input shape: `(batch, 3, 120)` &nbsp;·&nbsp; Output: 2 values `[SBP, DBP]` in mmHg.
+
+| # | Layer | In → Out ch | Kernel | Pad | Extras |
+|---|---|---|---|---|---|
+| 1 | Conv1d | 3 → 16 | 15 | 7 | BN, ReLU |
+| 2 | Conv1d | 16 → 32 | 15 | 7 | BN, ReLU, Dropout 0.2 |
+| 3 | Conv1d | 32 → 64 | 15 | 7 | BN, ReLU |
+| 4 | Conv1d | 64 → 32 | 15 | 7 | BN, ReLU, Dropout 0.4 |
+| 5 | Conv1d | 32 → 16 | 15 | 7 | BN, ReLU |
+| 6 | Conv1d | 16 → 1  | 1  | 0 | channel collapse |
+| 7 | Flatten + Linear (120 → 2) | — | — | — | → `[SBP, DBP]` |
+
+Padding = 7 with kernel = 15 preserves the temporal length, so the Linear head sees exactly `input_length = 120`.
+
+### Results
+
+Test set, SBP (n = 21,636 windows):
+
+| Metric | Pre-calibration | Post-calibration |
+|---|---|---|
+| Bias (mean error) | −0.43 mmHg | ~0 mmHg |
+| SD of error | 21.16 mmHg | 19.81 mmHg |
+| **MAE** | **16.60 mmHg** | **15.86 mmHg** |
+| n (windows) | 21,636 | 21,636 |
+
+Global linear calibration fit on the test set:
+
+```
+SBP_cal = 0.5840 · SBP_pred + 51.92
+```
+
+### Reproducing these results
+
+1. Load the pre-processed 137-subject / 1000-rows-per-subject dataframe (request access — see [data/preprocessing_ready_set/about.txt](data/preprocessing_ready_set/about.txt)) **or** regenerate it via [segment_to_cycle_loader.ipynb](segment_to_cycle_loader.ipynb) on the 19-subject set.
+2. Open [three_channel_ppg_peak2peak_subjects.ipynb](three_channel_ppg_peak2peak_subjects.ipynb) and run the cells end-to-end with the configuration above (batch 128, LR 1e-4, 60 epochs, L1 loss).
+3. The notebook saves the checkpoint under [models/](models/) and the per-window predictions under [results/](results/); calibration and the Bland–Altman / scatter plots are produced in the evaluation cells.
+
+---
 
 ## Notes
 
@@ -273,11 +343,11 @@ The segmentation and preprocessing pipeline considered local subject dataframes 
 - Use CUDA-enabled GPU for faster training
 - Adjust batch sizes based on available memory
 - Consider data augmentation for smaller datasets
-- **Recommended:** Use pre-processed data from `preprocessing_ready_set/` for faster iteration and re-train the overall model architecture via gather same results which mentioned in resulst part.
+- **Recommended:** Use pre-processed data from `preprocessing_ready_set/` for faster iteration, then retrain the model architecture to reproduce the numbers reported in the [Experimental Setup, Architecture & Results](#experimental-setup-architecture--results) section.
 
 ### Data Validation
 - Pre-processed datasets in `preprocessing_ready_set/` have been validated
-- metnioned detailed results and validation metrics in evaulation part of `three_channel_ppg_peak2peak_subjects.ipynb`
+- Detailed results and validation metrics are reported in the evaluation part of [three_channel_ppg_peak2peak_subjects.ipynb](three_channel_ppg_peak2peak_subjects.ipynb)
 - Custom processed data should be validated against known benchmarks
 
 ---
